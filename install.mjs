@@ -110,13 +110,16 @@ function createLog(file, secret) {
 
 function run(command, args, options = {}) {
     return new Promise((resolve, reject) => {
-        const child = spawn(command, args, {
+        const spawnOptions = {
             cwd: options.cwd,
             env: options.env || process.env,
             shell: Boolean(options.shell),
             windowsHide: true,
             stdio: options.stdio || 'inherit',
-        });
+        };
+        const child = options.shell
+            ? spawn([command, ...args].join(' '), spawnOptions)
+            : spawn(command, args, spawnOptions);
         let stdout = '';
         let stderr = '';
         if (options.stdio === 'pipe') {
@@ -450,7 +453,7 @@ function upsertSecret(secrets, value) {
 
 async function nodeCommandLines() {
     const output = await ps(
-        "Get-CimInstance Win32_Process -Filter \"Name = 'node.exe'\" | Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress -Depth 3",
+        "Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(node|cmd)\\.exe$' } | Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress -Depth 3",
     );
     if (!output) return [];
     const parsed = JSON.parse(output);
@@ -458,7 +461,7 @@ async function nodeCommandLines() {
 }
 
 async function stopServer(stRoot) {
-    const marker = path.resolve(stRoot, 'server.js').toLowerCase();
+    const markers = [path.resolve(stRoot, 'server.js').toLowerCase(), 'wutavern-server.cmd'];
     let rows = [];
     try {
         rows = await nodeCommandLines();
@@ -466,7 +469,10 @@ async function stopServer(stRoot) {
         rows = [];
     }
     const pids = rows
-        .filter(row => String(row.CommandLine || '').toLowerCase().includes(marker))
+        .filter(row => {
+            const command = String(row.CommandLine || '').toLowerCase();
+            return markers.some(marker => command.includes(marker));
+        })
         .map(row => Number(row.ProcessId))
         .filter(pid => Number.isInteger(pid) && pid > 0);
     if (pids.length === 0) return false;
@@ -686,7 +692,8 @@ async function startSt(ctx, opts) {
     fs.mkdirSync(path.dirname(serverLog), { recursive: true });
     const args = [path.join(ctx.stRoot, 'server.js')];
     if (opts.noBrowser) args.push('--browserLaunchEnabled=false');
-    const pid = await startDetached(ctx.stRoot, args, serverLog, errorLog);
+    const launcherPid = await startDetached(ctx.stRoot, args, serverLog, errorLog);
+    const pid = await serverNodePid(ctx.stRoot, launcherPid);
     const pidFile = path.join(ctx.dataRoot, '.wutavern.pid');
     fs.writeFileSync(pidFile, `${pid}\n`);
     try {
@@ -716,18 +723,46 @@ function psSingle(value) {
     return `'${String(value).replace(/'/g, "''")}'`;
 }
 
+async function serverNodePid(stRoot, fallback) {
+    const marker = path.resolve(stRoot, 'server.js').toLowerCase();
+    for (let attempt = 0; attempt < 25; attempt++) {
+        const rows = await nodeCommandLines().catch(() => []);
+        const node = rows.find(row => {
+            const command = String(row.CommandLine || '').toLowerCase();
+            return command.includes(marker) && command.includes('node');
+        });
+        if (node) return Number(node.ProcessId);
+        await sleep(200);
+    }
+    return fallback;
+}
+
+function quoteCmd(value) {
+    return `"${String(value).replace(/"/g, '')}"`;
+}
+
 async function startDetached(stRoot, args, outLog, errLog) {
+    // WMI starts the process outside this console's job, so it keeps running
+    // after the launcher exits.
+    const bat = path.join(path.dirname(outLog), 'wutavern-server.cmd');
+    const body = [
+        '@echo off',
+        'set NODE_ENV=production',
+        `${quoteCmd(process.execPath)} ${args.map(quoteCmd).join(' ')} >> ${quoteCmd(outLog)} 2>> ${quoteCmd(errLog)}`,
+    ].join('\r\n');
+    fs.writeFileSync(bat, `${body}\r\n`);
+    const commandLine = `cmd.exe /d /c ${quoteCmd(bat)}`;
     const script = [
-        "$env:NODE_ENV = 'production'",
-        `$p = Start-Process -FilePath ${psSingle(process.execPath)} -ArgumentList @(${args.map(psSingle).join(',')}) -WorkingDirectory ${psSingle(stRoot)} -RedirectStandardOutput ${psSingle(outLog)} -RedirectStandardError ${psSingle(errLog)} -PassThru -WindowStyle Hidden`,
-        '$p.Id',
+        `$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = ${psSingle(commandLine)}; CurrentDirectory = ${psSingle(stRoot)} }`,
+        'if ($r.ReturnValue -ne 0) { Write-Error ("Win32_Process.Create " + $r.ReturnValue); exit 1 }',
+        '$r.ProcessId',
     ].join('\n');
     const file = path.join(os.tmpdir(), `wutavern-start-${process.pid}.ps1`);
     fs.writeFileSync(file, script, 'utf8');
     try {
         const output = await ps(`& ${psSingle(file)}`);
         const id = Number(output.split(/\r?\n/).filter(Boolean).pop());
-        if (!Number.isInteger(id) || id <= 0) throw new Error('Start-Process did not return a pid');
+        if (!Number.isInteger(id) || id <= 0) throw new Error('Win32_Process.Create did not return a pid');
         return id;
     } finally {
         fs.rmSync(file, { force: true });
@@ -778,8 +813,16 @@ async function main() {
         if (!error.stageLogged) log.line('install', 'fail', { error: oneLine(error, opts.key) });
         process.exitCode = 1;
     }
-    // Keep-alive sockets to SillyTavern would otherwise hold the CLI open.
-    process.exit(process.exitCode || 0);
+    await releaseFetch();
+    // Immediate process.exit races Windows socket close and aborts the process.
+    setTimeout(() => process.exit(process.exitCode || 0), 500);
+}
+
+async function releaseFetch() {
+    const dispatcher = globalThis[Symbol.for('undici.globalDispatcher.1')];
+    if (dispatcher && typeof dispatcher.destroy === 'function') {
+        dispatcher.destroy();
+    }
 }
 
 main();
