@@ -752,12 +752,11 @@ async function main() {
         opts = parseArgs(process.argv.slice(2));
     } catch (error) {
         console.error(oneLine(error, ''));
-        process.exitCode = 1;
-        return;
+        process.exit(1);
     }
     if (opts.help) {
         console.log(HELP);
-        return;
+        process.exit(0);
     }
     const log = createLog(opts.logFile, opts.key);
     try {
@@ -779,6 +778,8 @@ async function main() {
         if (!error.stageLogged) log.line('install', 'fail', { error: oneLine(error, opts.key) });
         process.exitCode = 1;
     }
+    // Keep-alive sockets to SillyTavern would otherwise hold the CLI open.
+    process.exit(process.exitCode || 0);
 }
 
 main();
