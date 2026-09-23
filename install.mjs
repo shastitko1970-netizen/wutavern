@@ -1,21 +1,17 @@
 #!/usr/bin/env node
-// Windows launcher: SillyTavern release + WuApi + pack/wu-arc-mode.
-// Field names are checked against the installed release (confirmed on 1.19).
+// Windows installer-launcher: SillyTavern release + WuApi.
+// Does not install extensions. Field names checked against the installed release (1.19).
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 
-const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const MANIFEST_PATH = path.join(ROOT, 'pack', 'wu-arc-mode', 'manifest.json');
 const SECRET_KEY = 'api_key_custom';
 const SECRET_LABEL = 'WuApi';
-const QR_ID = 'quick-reply';
 
-const HELP = `WuTavern — SillyTavern + WuApi + Memory Books
+const HELP = `WuTavern — installer and launcher for SillyTavern + WuApi
 
   node install.mjs [--st-root PATH] [--wuapi-base-url URL] [--wuapi-key KEY]
                    [--port N] [--log FILE] [--no-start] [--no-browser]
@@ -235,28 +231,6 @@ function normalizeBaseUrl(raw) {
     return url;
 }
 
-function loadManifest() {
-    const manifest = readJson(MANIFEST_PATH);
-    if (manifest.id !== 'wu-arc-mode' || String(manifest.version) !== '1') {
-        throw new Error('pack manifest must be wu-arc-mode version 1');
-    }
-    if (!Array.isArray(manifest.extensions) || !Array.isArray(manifest.enable)) {
-        throw new Error('pack manifest is missing extensions or enable');
-    }
-    for (const extension of manifest.extensions) {
-        if (extension.install !== 'third-party') {
-            throw new Error(`${extension.name || 'extension'} install must be third-party`);
-        }
-        if (!/^https:\/\/github\.com\/[^/]+\/[^/]+\/?$/.test(extension.url || '')) {
-            throw new Error(`${extension.name || 'extension'} url must be a public GitHub repo`);
-        }
-        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,60}$/.test(extension.name || '')) {
-            throw new Error('extension name is not a safe directory name');
-        }
-    }
-    return manifest;
-}
-
 function mustInclude(file, needles) {
     const text = fs.readFileSync(file, 'utf8');
     for (const needle of needles) {
@@ -272,20 +246,7 @@ function assertReleaseContract(stRoot) {
         'request.body.custom_url',
         '/chat/completions',
     ]);
-    mustInclude(path.join(stRoot, 'public', 'script.js'), [
-        'oai_settings: oai_settings',
-        'world_info_settings:',
-        'extension_settings: extension_settings',
-    ]);
-    mustInclude(path.join(stRoot, 'src', 'server-startup.js'), ['/api/extensions']);
-    mustInclude(path.join(stRoot, 'src', 'constants.js'), ['public/scripts/extensions/third-party']);
-    mustInclude(path.join(stRoot, 'public', 'scripts', 'extensions', 'quick-reply', 'index.js'), [
-        'quickReplyV2',
-        'isEnabled',
-    ]);
-    if (!fs.existsSync(path.join(stRoot, 'public', 'scripts', 'world-info.js'))) {
-        throw new Error('public/scripts/world-info.js is missing');
-    }
+    mustInclude(path.join(stRoot, 'public', 'script.js'), ['oai_settings: oai_settings']);
     const pkg = readJson(path.join(stRoot, 'package.json'));
     if (pkg.name !== 'sillytavern') throw new Error(`${stRoot} is not SillyTavern`);
     return pkg.version || '';
@@ -409,16 +370,6 @@ function loadSettings(ctx) {
     return settings;
 }
 
-function extensionSettings(settings) {
-    if (!settings.extension_settings || typeof settings.extension_settings !== 'object' || Array.isArray(settings.extension_settings)) {
-        settings.extension_settings = {};
-    }
-    if (!Array.isArray(settings.extension_settings.disabledExtensions)) {
-        settings.extension_settings.disabledExtensions = [];
-    }
-    return settings.extension_settings;
-}
-
 function normalizeSecrets(secrets) {
     const values = Object.values(secrets);
     const hasArray = values.some(value => Array.isArray(value));
@@ -522,92 +473,6 @@ async function writeWuApi(ctx, opts) {
     };
 }
 
-function dropDisabled(settings, names) {
-    const ext = extensionSettings(settings);
-    ext.disabledExtensions = ext.disabledExtensions.filter(name => !names.includes(name));
-}
-
-function enableWi(settings, stRoot) {
-    if (!fs.existsSync(path.join(stRoot, 'public', 'scripts', 'world-info.js'))) {
-        throw new Error('World Info module is missing');
-    }
-    if (!settings.world_info_settings || typeof settings.world_info_settings !== 'object' || Array.isArray(settings.world_info_settings)) {
-        const defaults = readJson(path.join(stRoot, 'default', 'content', 'settings.json'));
-        if (!defaults.world_info_settings) throw new Error('world_info_settings is missing from this release');
-        settings.world_info_settings = defaults.world_info_settings;
-    }
-    dropDisabled(settings, ['world-info', 'WI']);
-}
-
-function enableQr(settings, stRoot) {
-    const index = path.join(stRoot, 'public', 'scripts', 'extensions', 'quick-reply', 'index.js');
-    if (!fs.existsSync(index)) throw new Error('quick-reply extension is missing');
-    dropDisabled(settings, [QR_ID]);
-    const ext = extensionSettings(settings);
-    const current = ext.quickReplyV2 && typeof ext.quickReplyV2 === 'object' ? ext.quickReplyV2 : {};
-    current.isEnabled = true;
-    if (!current.config || typeof current.config !== 'object') {
-        current.config = { setList: [{ set: 'Default', isVisible: true }] };
-    }
-    ext.quickReplyV2 = current;
-}
-
-const ENABLERS = { WI: enableWi, QR: enableQr };
-
-function thirdPartyDir(stRoot, name) {
-    const root = path.resolve(stRoot, 'public', 'scripts', 'extensions', 'third-party');
-    const dest = path.resolve(root, name);
-    if (dest !== root && !dest.startsWith(`${root}${path.sep}`)) {
-        throw new Error('refusing to install outside third-party');
-    }
-    return dest;
-}
-
-async function installExtension(stRoot, extension) {
-    const dest = thirdPartyDir(stRoot, extension.name);
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    const manifestPath = path.join(dest, 'manifest.json');
-    if (!fs.existsSync(manifestPath)) {
-        if (fs.existsSync(dest)) throw new Error(`${dest} exists without manifest.json`);
-        await run('git', ['clone', '--depth', '1', extension.url, dest]);
-    }
-    const manifest = readJson(manifestPath);
-    if (!manifest.js || !fs.existsSync(path.join(dest, manifest.js))) {
-        throw new Error(`${extension.name} manifest js file is missing`);
-    }
-    return { dest, displayName: manifest.display_name || extension.name };
-}
-
-async function installPack(ctx, opts) {
-    await stopServer(ctx.stRoot);
-    const manifest = loadManifest();
-    const installed = [];
-    for (const extension of manifest.extensions) {
-        installed.push(await installExtension(ctx.stRoot, extension));
-    }
-    const settings = loadSettings(ctx);
-    for (const extension of manifest.extensions) {
-        dropDisabled(settings, [extension.name, `third-party/${extension.name}`]);
-    }
-    for (const id of manifest.enable) {
-        const enable = ENABLERS[id];
-        if (!enable) throw new Error(`unknown enable id ${id}`);
-        enable(settings, ctx.stRoot);
-    }
-    writeJson(settingsFile(ctx), settings);
-    const check = readJson(settingsFile(ctx));
-    if (check.extension_settings?.quickReplyV2?.isEnabled !== true) throw new Error('QR did not stay enabled');
-    if (!check.world_info_settings) throw new Error('WI settings are missing');
-    if ((check.extension_settings.disabledExtensions || []).includes(QR_ID)) throw new Error('quick-reply is still disabled');
-    return {
-        log: {
-            extension: installed.map(item => item.dest).join(','),
-            wi: 'on',
-            qr: 'on',
-        },
-    };
-}
-
 async function portAcceptsHttp(port) {
     try {
         await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(1500) });
@@ -645,35 +510,11 @@ function tail(file) {
     return fs.readFileSync(file, 'utf8').slice(-400).replace(/\s+/g, ' ').trim();
 }
 
-async function discoverExtensions(port) {
-    const base = `http://127.0.0.1:${port}`;
-    const tokenResponse = await fetch(`${base}/csrf-token`, { signal: AbortSignal.timeout(10000) });
-    if (!tokenResponse.ok) throw new Error(`csrf-token returned ${tokenResponse.status}`);
-    const cookies = typeof tokenResponse.headers.getSetCookie === 'function'
-        ? tokenResponse.headers.getSetCookie().map(cookie => cookie.split(';')[0]).join('; ')
-        : '';
-    const body = await tokenResponse.json();
-    const response = await fetch(`${base}/api/extensions/discover`, {
-        headers: {
-            'x-csrf-token': body.token,
-            cookie: cookies,
-            accept: 'application/json',
-        },
-        signal: AbortSignal.timeout(15000),
-    });
-    if (!response.ok) throw new Error(`discover returned ${response.status}`);
-    const list = await response.json();
-    if (!Array.isArray(list)) throw new Error('discover did not return a list');
-    return list;
-}
-
 function assertConfigured(ctx, opts) {
     const settings = readJson(settingsFile(ctx));
     if (settings.main_api !== 'openai') throw new Error('main_api is not openai');
     if (settings.oai_settings?.chat_completion_source !== 'custom') throw new Error('chat source is not custom');
     if (settings.oai_settings?.custom_url !== opts.baseUrl) throw new Error('custom_url changed after start');
-    if (settings.extension_settings?.quickReplyV2?.isEnabled !== true) throw new Error('QR is off after start');
-    if (!settings.world_info_settings) throw new Error('WI settings missing after start');
     const secrets = readJson(secretsFile(ctx));
     const active = (secrets[SECRET_KEY] || []).find(entry => entry && entry.active);
     if (!active || active.value !== opts.key) throw new Error('active api_key_custom does not match the provided key');
@@ -698,10 +539,6 @@ async function startSt(ctx, opts) {
     fs.writeFileSync(pidFile, `${pid}\n`);
     try {
         await waitReady(ctx.port, pid, errorLog);
-        const list = await discoverExtensions(ctx.port);
-        const names = new Set(list.map(item => item.name));
-        if (!names.has('third-party/MemoryBooks')) throw new Error('Memory Books is not in Extensions');
-        if (!names.has(QR_ID)) throw new Error('quick-reply is not in Extensions');
         assertConfigured(ctx, opts);
         return {
             log: {
@@ -803,11 +640,9 @@ async function main() {
         }
         if (/[\r\n]/.test(opts.key)) throw new Error('WUAPI_KEY must be one line');
         opts.baseUrl = normalizeBaseUrl(opts.baseUrl);
-        await run('git', ['--version'], { stdio: 'ignore' });
         await run('npm', ['--version'], { shell: true, stdio: 'ignore' });
         const installed = await stage(log, 'install', opts.key, () => installSt(opts));
         await stage(log, 'wuapi', opts.key, () => writeWuApi(installed, opts));
-        await stage(log, 'pack', opts.key, () => installPack(installed, opts));
         await stage(log, 'start', opts.key, () => startSt(installed, opts));
     } catch (error) {
         if (!error.stageLogged) log.line('install', 'fail', { error: oneLine(error, opts.key) });
