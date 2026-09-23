@@ -24,7 +24,7 @@ $env:WUAPI_KEY = "wu-..."
 node install.mjs
 ```
 
-Флаги: `--wuapi-base-url`, `--wuapi-key`, `--st-root`, `--log`, `--no-start`, `--no-browser`. `--no-start` не поднимает сервер. Процесс `server.js` этого каталога всё равно останавливается перед записью, иначе открытая страница может затереть файл настроек.
+Флаги: `--wuapi-base-url`, `--wuapi-key`, `--st-root`, `--port`, `--log`, `--no-start`, `--no-browser`. `--port` записывает `port` в `config.yaml` SillyTavern. Без флага остаётся порт из конфига, по умолчанию 8000. `--no-start` не поднимает сервер. Процесс `server.js` этого каталога всё равно останавливается перед записью, иначе открытая страница может затереть файл настроек.
 
 `WUAPI_BASE_URL` — OpenAI-compatible корень. SillyTavern сам дописывает `/chat/completions`. Для WuApi укажите адрес вместе с `/v1`. Если в конце уже есть `/chat/completions`, лаунчер этот хвост убирает.
 

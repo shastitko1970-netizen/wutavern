@@ -18,7 +18,7 @@ const QR_ID = 'quick-reply';
 const HELP = `WuTavern — SillyTavern + WuApi + Memory Books
 
   node install.mjs [--st-root PATH] [--wuapi-base-url URL] [--wuapi-key KEY]
-                   [--log FILE] [--no-start] [--no-browser]
+                   [--port N] [--log FILE] [--no-start] [--no-browser]
 
   WUAPI_BASE_URL   OpenAI-compatible base. SillyTavern appends /chat/completions.
   WUAPI_KEY        key written to secrets.json (not to the log)
@@ -44,6 +44,7 @@ function parseArgs(argv) {
         baseUrl: process.env.WUAPI_BASE_URL || '',
         key: process.env.WUAPI_KEY || '',
         logFile: '',
+        port: 0,
         noStart: false,
         noBrowser: false,
         help: false,
@@ -62,7 +63,11 @@ function parseArgs(argv) {
         else if (arg === '--wuapi-base-url') opts.baseUrl = take();
         else if (arg === '--wuapi-key') opts.key = take();
         else if (arg === '--log') opts.logFile = take();
+        else if (arg === '--port') opts.port = Number(take());
         else throw new Error(`unknown argument ${arg}`);
+    }
+    if (opts.port && (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535)) {
+        throw new Error('--port must be a TCP port');
     }
     if (!opts.stRoot) opts.stRoot = defaultStRoot();
     if (!opts.logFile) opts.logFile = defaultLogFile();
@@ -168,6 +173,18 @@ function dataRootOf(stRoot) {
     const { text } = configText(stRoot);
     const raw = yamlScalar(text, 'dataRoot') || './data';
     return path.isAbsolute(raw) ? raw : path.resolve(stRoot, raw);
+}
+
+function writePort(stRoot, port) {
+    const configPath = path.join(stRoot, 'config.yaml');
+    if (!fs.existsSync(configPath)) {
+        fs.copyFileSync(path.join(stRoot, 'default', 'config.yaml'), configPath);
+    }
+    const text = fs.readFileSync(configPath, 'utf8');
+    const next = /^port:\s*\d+\s*$/m.test(text)
+        ? text.replace(/^port:\s*\d+\s*$/m, `port: ${port}`)
+        : `${text.replace(/\s*$/, '')}\nport: ${port}\n`;
+    fs.writeFileSync(configPath, next);
 }
 
 function portOf(stRoot) {
@@ -357,6 +374,7 @@ async function installSt(opts) {
         });
     }
     const version = assertReleaseContract(stRoot);
+    if (opts.port) writePort(stRoot, opts.port);
     const paths = userPaths(stRoot);
     return {
         ...paths,
